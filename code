@@ -1,0 +1,181 @@
+import agama
+import numpy as np
+import matplotlib.pyplot as plt
+import popkinmocks as pkm
+from astropy import units as u
+from astropy.coordinates.matrix_utilities import rotation_matrix
+
+
+class MockIFUFromEDF:
+    def __init__(self, edf, actionfinder, potential, N_samples, N_mock, inc_deg, pa_deg,
+                 ifu_scale=0.45, nx1=21, nx2=21, nv=50, vrng=(-500, 500),
+                 age_rebin=6, z_rebin=2, projection_percentile=95):
+
+        self.edf = edf
+        self.actionfinder = actionfinder
+        self.potential = potential
+
+        self.N_samples = N_samples
+        self.N_mock = N_mock
+
+        self.inc_deg = inc_deg
+        self.pa_deg = pa_deg
+
+        self.ifu_scale = ifu_scale
+        self.nx1 = nx1
+        self.nx2 = nx2
+        self.nv = nv
+        self.vrng = vrng
+
+        self.age_rebin = age_rebin
+        self.z_rebin = z_rebin
+        self.projection_percentile = projection_percentile
+
+        self.xv_mock = None
+        self.t_mock = None
+        self.z_mock = None
+
+        self.x1 = None
+        self.x2 = None
+        self.v = None
+
+        self.ssps = None
+        self.cube = None
+        self.simulation = None
+        self.p_v_x = None
+
+    def draw_samples(self, N):
+        galaxy_model = agama.GalaxyModel(potential=self.potential, df=self.edf, af=self.actionfinder)
+        xv, mass = galaxy_model.sample(N)
+        actions = self.actionfinder(xv)
+        t, z_m = self.edf.sample_age_metallicity(actions)
+        return xv, t, z_m
+
+    def make_mock(self):
+        self.xv_mock, self.t_mock, self.z_mock = self.draw_samples(self.N_mock)
+
+    def plot_R_age(self):
+        R_mock = np.sqrt(self.xv_mock[:, 0] ** 2 + self.xv_mock[:, 1] ** 2)
+
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+
+        ax[0].hist(R_mock, bins=60)
+        ax[0].set_xlabel("R [kpc]")
+        ax[0].set_ylabel("N")
+
+        ax[1].hist(self.t_mock, bins=40)
+        ax[1].set_xlabel("age [Gyr]")
+        ax[1].set_ylabel("N")
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_xy_age(self):
+        plt.figure(figsize=(6, 6))
+        plt.scatter(self.xv_mock[:, 0], self.xv_mock[:, 1], c=self.t_mock, s=1, cmap="viridis")
+        plt.colorbar(label="Age [Gyr]")
+        plt.xlabel("x [kpc]")
+        plt.ylabel("y [kpc]")
+        plt.axis("equal")
+        plt.show()
+
+    def rotation_matrix_x_numpy(self, angle):
+        c = np.cos(angle)
+        s = np.sin(angle)
+        return np.array([[1.0, 0.0, 0.0], [0.0, c, s], [0.0, -s, c]])
+
+    def rotation_matrix_z_numpy(self, angle):
+        c = np.cos(angle)
+        s = np.sin(angle)
+        return np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
+
+    def projected_to_losvd_numpy(self, samples, inc_deg=0.0, pa_deg=0.0):
+        pos = samples[:, 0:3]
+        vel = samples[:, 3:6]
+
+        inc = np.deg2rad(inc_deg)
+        pa = np.deg2rad(pa_deg)
+
+        R_inc = self.rotation_matrix_x_numpy(-inc)
+        R_pa = self.rotation_matrix_z_numpy(-pa)
+
+        R = R_pa @ R_inc
+
+        pos_sky = pos @ R.T
+        vel_sky = vel @ R.T
+
+        x1 = pos_sky[:, 0]
+        x2 = pos_sky[:, 1]
+        v = vel_sky[:, 2]
+
+        return x1, x2, v
+
+    def projected_to_losvd_astropy(self, samples, inc_deg=0.0, pa_deg=0.0):
+        pos = samples[:, 0:3]
+        vel = samples[:, 3:6]
+
+        R_inc = rotation_matrix(-inc_deg * u.deg, axis="x")
+        R_pa = rotation_matrix(-pa_deg * u.deg, axis="z")
+
+        R = np.asarray(R_pa @ R_inc)
+
+        pos_sky = pos @ R.T
+        vel_sky = vel @ R.T
+
+        x1 = pos_sky[:, 0]
+        x2 = pos_sky[:, 1]
+        v = vel_sky[:, 2]
+
+        return x1, x2, v
+
+    def project(self):
+        self.x1, self.x2, self.v = self.projected_to_losvd_astropy(self.xv_mock, inc_deg=self.inc_deg, pa_deg=self.pa_deg)
+
+    def rescale_projection(self):
+        scale = np.nanpercentile(np.sqrt(self.x1**2 + self.x2**2), self.projection_percentile)
+
+        self.x1 = self.ifu_scale * self.x1 / scale
+        self.x2 = self.ifu_scale * self.x2 / scale
+
+    def make_cube(self):
+        self.ssps = pkm.milesSSPs(age_rebin=self.age_rebin, z_rebin=self.z_rebin)
+
+        self.cube = pkm.ifu_cube.IFUCube(ssps=self.ssps, nx1=self.nx1, nx2=self.nx2, nv=self.nv, vrng=self.vrng)
+
+        self.simulation = pkm.components.FromParticle(self.cube, self.t_mock, self.v, self.x1, self.x2, self.z_mock)
+
+        self.p_v_x = self.simulation.get_p("v_x", light_weighted=True, density=False)
+
+    def plot_brightest_spaxel(self):
+        p_v_x = self.p_v_x
+        cube = self.cube
+
+        if p_v_x.shape[0] == cube.nv:
+            light_map = np.nansum(p_v_x, axis=0)
+            ix1, ix2 = np.unravel_index(np.nanargmax(light_map), light_map.shape)
+            losvd = p_v_x[:, ix1, ix2]
+
+        else:
+            light_map = np.nansum(p_v_x, axis=2)
+            ix1, ix2 = np.unravel_index(np.nanargmax(light_map), light_map.shape)
+            losvd = p_v_x[ix1, ix2, :]
+
+        plt.figure(figsize=(7, 5))
+        plt.plot(losvd)
+        plt.xlabel("velocity bin")
+        plt.ylabel("light-weighted LOSVD")
+        plt.title("brightest spaxel")
+        plt.tight_layout()
+        plt.show()
+
+    def run(self):
+        self.make_mock()
+
+        self.plot_R_age()
+        self.plot_xy_age()
+
+        self.project()
+        self.rescale_projection()
+
+        self.make_cube()
+        self.plot_brightest_spaxel()
