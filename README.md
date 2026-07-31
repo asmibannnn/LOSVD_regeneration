@@ -1,13 +1,13 @@
 # LOSVD_regeneration
 # Mock IFU from EDF
 
-A Python class for generating mock IFU observations from an **extended distribution function (EDF)** using `agama` and `popkinmocks`.
+A Python class for generating mock IFU observations from an extended distribution function (EDF) using `agama` and `popkinmocks`.
 
 ## Workflow
 
 The `MockIFUFromEDF` class:
 
-1. Samples particles from an `agama.GalaxyModel`.
+1. Samples particles from a galaxy model.
 2. Assigns stellar ages and metallicities from the EDF.
 3. Projects positions and velocities using the galaxy inclination and position angle.
 4. Rescales the projected galaxy to the chosen IFU size.
